@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ufcpro-mcp
+description: MCP-powered job assistant for ufcpro.in (chat UI + MCP server + Bedrock)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

@@ -1,0 +1,26 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets — never commit
+*.env
+.env
+*secret*
+*client_secret*
+cognito_secret*
+
+# Terraform
+deploy/terraform/.terraform/
+deploy/terraform/*.tfstate
+deploy/terraform/*.tfstate.*
+deploy/terraform/.terraform.lock.hcl
+
+# Helm packaged charts
+*.tgz
+
+# Build artifacts
+ecr_url.txt
+
+# OS
+.DS_Store

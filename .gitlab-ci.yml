@@ -1,0 +1,248 @@
+stages:
+  - start
+  - validate
+  - security
+  - infra
+  - build
+  - scan-image
+  - package
+  - release
+  - deploy
+  - smoke-test
+  - done
+
+variables:
+  AWS_REGION: us-east-1
+  APP_NAME: ufcpro-mcp
+  CLUSTER_NAME: rag-lab
+  NAMESPACE: ufcpro
+  LIVE_URL: "https://job.ufcpro.in"
+  ECR_REGISTRY: "${AWS_ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com"
+  IMAGE_TAG: "${CI_COMMIT_SHORT_SHA}"
+
+# ---------------------------------------------------------------------------
+# GitLab -> AWS via OIDC (no static access keys stored in GitLab).
+# ---------------------------------------------------------------------------
+.aws_oidc: &aws_oidc
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  before_script:
+    - >
+      export CREDS=$(aws sts assume-role-with-web-identity
+      --role-arn "$AWS_CI_ROLE_ARN"
+      --role-session-name "gitlab-$CI_PIPELINE_ID"
+      --web-identity-token "$GITLAB_OIDC_TOKEN"
+      --query 'Credentials' --output json)
+    - export AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r .AccessKeyId)
+    - export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r .SecretAccessKey)
+    - export AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .SessionToken)
+
+# ===========================================================================
+# STAGE 0 — ONE BUTTON. Click "play" on this job to run the whole deploy.
+# Everything after it waits for this gate, so one click = end-to-end deploy.
+# ===========================================================================
+start-deploy:
+  stage: start
+  image: alpine:3.20
+  script:
+    - echo "Starting end-to-end deployment of $APP_NAME ($IMAGE_TAG)..."
+  when: manual
+  allow_failure: false
+  only:
+    - main
+
+# ===========================================================================
+# STAGE 1 — validate
+# ===========================================================================
+lint-terraform:
+  stage: validate
+  image: hashicorp/terraform:1.9
+  needs: ["start-deploy"]
+  script:
+    - cd deploy/terraform
+    - terraform init -backend=false
+    - terraform fmt -check
+    - terraform validate
+
+lint-helm:
+  stage: validate
+  image: alpine/helm:3.15.0
+  needs: ["start-deploy"]
+  script:
+    - helm lint deploy/helm
+    - helm template ufcpro-mcp deploy/helm --namespace $NAMESPACE > /dev/null
+
+# ===========================================================================
+# STAGE 2 — security scanning
+# ===========================================================================
+tfsec:
+  stage: security
+  image:
+    name: aquasec/tfsec:latest
+    entrypoint: [""]
+  script:
+    - tfsec deploy/terraform --minimum-severity HIGH --no-color
+
+checkov:
+  stage: security
+  image:
+    name: bridgecrew/checkov:latest
+    entrypoint: [""]
+  script:
+    - checkov -d deploy/terraform --compact --quiet
+    - checkov -d deploy/helm --framework helm --compact --quiet
+
+opa-conftest:
+  stage: security
+  image:
+    name: openpolicyagent/conftest:latest
+    entrypoint: [""]
+  script:
+    - apk add --no-cache helm || true
+    - conftest test <(helm template ufcpro-mcp deploy/helm --namespace $NAMESPACE) --policy deploy/policy
+
+trivy-fs:
+  stage: security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy fs . --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 --no-progress
+
+# ===========================================================================
+# STAGE 3 — infrastructure (ECR, IAM role, Pod Identity association)
+# ===========================================================================
+terraform-apply:
+  stage: infra
+  image: hashicorp/terraform:1.9
+  <<: *aws_oidc
+  script:
+    - cd deploy/terraform
+    - terraform init
+    - terraform apply -auto-approve
+  only:
+    - main
+
+# ===========================================================================
+# STAGE 4 — build image and push to ECR
+# ===========================================================================
+build-image:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  <<: *aws_oidc
+  script:
+    - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+    - docker build -t $ECR_REGISTRY/$APP_NAME:$IMAGE_TAG -t $ECR_REGISTRY/$APP_NAME:latest .
+    - docker push $ECR_REGISTRY/$APP_NAME:$IMAGE_TAG
+    - docker push $ECR_REGISTRY/$APP_NAME:latest
+  only:
+    - main
+
+# ===========================================================================
+# STAGE 5 — scan the built image for CVEs
+# ===========================================================================
+trivy-image:
+  stage: scan-image
+  image: docker:27
+  services:
+    - docker:27-dind
+  <<: *aws_oidc
+  script:
+    - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+    - docker pull $ECR_REGISTRY/$APP_NAME:$IMAGE_TAG
+    - docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest
+        image --severity HIGH,CRITICAL --exit-code 1 --no-progress $ECR_REGISTRY/$APP_NAME:$IMAGE_TAG
+  only:
+    - main
+
+# ===========================================================================
+# STAGE 6 — package Helm chart to ECR (OCI)
+# ===========================================================================
+package-helm:
+  stage: package
+  image: alpine/helm:3.15.0
+  <<: *aws_oidc
+  script:
+    - aws ecr get-login-password --region $AWS_REGION | helm registry login --username AWS --password-stdin $ECR_REGISTRY
+    - helm package deploy/helm --version 0.1.0-$IMAGE_TAG
+    - helm push ufcpro-mcp-0.1.0-$IMAGE_TAG.tgz oci://$ECR_REGISTRY
+
+# ===========================================================================
+# STAGE 7 — release: bump image tag in Git (GitOps source of truth)
+# ===========================================================================
+release:
+  stage: release
+  image: alpine:3.20
+  script:
+    - apk add --no-cache git
+    - git config user.email "ci@ufcpro.in"
+    - git config user.name "gitlab-ci"
+    - sed -i "s|tag:.*|tag: $IMAGE_TAG|" deploy/helm/values.yaml
+    - git add deploy/helm/values.yaml
+    - git commit -m "ci: deploy image $IMAGE_TAG [skip ci]" || echo "no change"
+    - git push https://oauth2:${GITLAB_DEPLOY_TOKEN}@gitlab.com/${CI_PROJECT_PATH}.git HEAD:main
+  only:
+    - main
+
+# ===========================================================================
+# STAGE 8 — deploy: ArgoCD syncs the new revision and waits until healthy
+# ===========================================================================
+deploy:
+  stage: deploy
+  image: alpine:3.20
+  script:
+    - apk add --no-cache curl
+    - curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+    - chmod +x /usr/local/bin/argocd
+    - argocd login $ARGOCD_SERVER --username $ARGOCD_USER --password $ARGOCD_PASSWORD --grpc-web
+    - argocd app sync ufcpro-mcp --grpc-web
+    - argocd app wait ufcpro-mcp --health --timeout 300 --grpc-web
+  environment:
+    name: production
+    url: https://job.ufcpro.in
+  only:
+    - main
+
+# ===========================================================================
+# STAGE 9 — smoke test: actually hit the live site and check it works
+# ===========================================================================
+smoke-test:
+  stage: smoke-test
+  image: alpine:3.20
+  script:
+    - apk add --no-cache curl
+    - echo "Smoke testing $LIVE_URL ..."
+    # Home page must return 200
+    - |
+      CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$LIVE_URL/")
+      echo "GET / -> $CODE"
+      [ "$CODE" = "200" ] || { echo "Home page not healthy (got $CODE)"; exit 1; }
+    # /chat must require auth (401 without login) — proves the auth gate works
+    - |
+      CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 -X POST \
+             -H "Content-Type: application/json" -d '{"message":"hi"}' "$LIVE_URL/chat")
+      echo "POST /chat (no auth) -> $CODE"
+      [ "$CODE" = "401" ] || { echo "Auth gate not enforced (got $CODE)"; exit 1; }
+    - echo "Smoke test passed."
+  only:
+    - main
+
+# ===========================================================================
+# STAGE 10 — done: print the final clickable live link
+# ===========================================================================
+live-link:
+  stage: done
+  image: alpine:3.20
+  script:
+    - echo "============================================================"
+    - echo "  DEPLOYMENT COMPLETE"
+    - echo "  Live site: $LIVE_URL"
+    - echo "============================================================"
+  environment:
+    name: production
+    url: https://job.ufcpro.in
+  only:
+    - main

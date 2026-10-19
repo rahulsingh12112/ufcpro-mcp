@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "ufcpro-jobs": {
+      "command": "/Users/snghptm/Downloads/JOB-TG-OCT/ufcpro-mcp/.venv/bin/python",
+      "args": [
+        "/Users/snghptm/Downloads/JOB-TG-OCT/ufcpro-mcp/mcp_server.py"
+      ],
+      "env": {
+        "UFCPRO_BASE": "https://ufcpro.in"
+      },
+      "disabled": false
+    }
+  }
+}

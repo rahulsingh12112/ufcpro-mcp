@@ -1,0 +1,45 @@
+replicaCount: 2
+
+image:
+  repository: REPLACE_WITH_ECR_URL
+  tag: latest
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  name: ufcpro-mcp-sa
+
+service:
+  port: 80
+  targetPort: 8800
+
+ingress:
+  enabled: true
+  host: job.ufcpro.in
+  # ACM cert ARN for HTTPS on the ALB (us-east-1)
+  certificateArn: REPLACE_WITH_ACM_CERT_ARN
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 500m
+    memory: 1Gi
+
+env:
+  AWS_REGION: us-east-1
+  MCP_MODEL: us.anthropic.claude-haiku-4-5-20251001-v1:0
+  UFCPRO_BASE: https://ufcpro.in
+  COGNITO_POOL_ID: us-east-1_5m6YFk458
+  COGNITO_CLIENT_ID: 49uc5q4r2lm1bckj7uk8s8mjfh
+  COGNITO_DOMAIN: https://us-east-15m6yfk458.auth.us-east-1.amazoncognito.com
+  COGNITO_REDIRECT_URI: https://job.ufcpro.in/callback
+
+# Secrets (COGNITO_CLIENT_SECRET, FLASK_SECRET) come from a K8s Secret, not here.
+secretName: ufcpro-mcp-secrets
